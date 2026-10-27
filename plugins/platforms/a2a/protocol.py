@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import threading
 import time
 import uuid
@@ -86,8 +87,11 @@ def skills_from_toolsets(toolsets: list[str] | dict[str, list[str]] | None) -> l
     if not isinstance(toolsets, dict):
         toolsets = {ts: [] for ts in set(toolsets or [])}
     skills = [{"id": f"toolset.{name}", "name": name, "description": f"Hermes '{name}' capabilities",
-               "tags": [name] + [str(t) for t in (toolsets[name] or [])][:10]} for name in sorted(toolsets)]
-    return skills or [{"id": "general", "name": "general", "description": "General-purpose conversational agent", "tags": ["general"]}]
+               "tags": [name] + [str(t) for t in (toolsets[name] or [])][:10],
+               "inputModes": ["text/plain"], "outputModes": ["text/plain"]} for name in sorted(toolsets)]
+    return skills or [{"id": "general", "name": "general", "description": "General-purpose conversational agent",
+                       "tags": ["general"], "inputModes": ["text/plain"], "outputModes": ["text/plain"]}]
+
 
 
 def jsonrpc_result(req_id: Any, result: Any) -> dict:
@@ -137,6 +141,32 @@ def message_context_id(scope: str, message_id: str) -> str:
 def text_part(text: str) -> dict:
     """v1.0 text Part (member-presence discriminated, no ``kind``)."""
     return {"text": text, "mediaType": "text/plain"}
+
+
+def data_part(data: Any, media_type: str = "application/json") -> dict:
+    """v1.0 data Part carrying a structured JSON value (member-presence
+    discriminated, no ``kind``). Used for outbound results so clients can read
+    ``parts[].data`` instead of scraping prose."""
+    return {"data": data, "mediaType": media_type}
+
+
+def _extract_fenced_json(text: str) -> Optional[Any]:
+    """Return the first fenced JSON block parsed from ``text``, or None.
+
+    Recognises ```json ... ``` and bare ``` ... ``` fences. Non-JSON or
+    malformed blocks yield None so callers degrade to text-only."""
+    if not isinstance(text, str) or not text:
+        return None
+    for m in re.finditer(r"```(?:json)?\s*\n(.*?)\n```", text, re.DOTALL | re.IGNORECASE):
+        candidate = m.group(1).strip()
+        if not candidate:
+            continue
+        try:
+            return json.loads(candidate)
+        except (json.JSONDecodeError, ValueError):
+            continue
+    return None
+
 
 
 def text_message(role: str, text: str, context_id: str = "") -> dict:
@@ -202,8 +232,13 @@ def build_task(task_id: str, context_id: str, state: str, agent_text: str = "", 
     if agent_text:
         task["status"]["message"] = text_message(ROLE_AGENT, agent_text, context_id)
         if state == STATE_COMPLETED:
-            task["artifacts"] = [{"artifactId": uuid.uuid4().hex, "parts": [text_part(agent_text)]}]
+            parts = [text_part(agent_text)]
+            parsed = _extract_fenced_json(agent_text)
+            if parsed is not None:
+                parts.append(data_part(parsed))
+            task["artifacts"] = [{"artifactId": uuid.uuid4().hex, "parts": parts}]
     return task
+
 
 
 def status_update(task_id: str, context_id: str, state: str, text: str = "") -> dict:
@@ -216,8 +251,13 @@ def status_update(task_id: str, context_id: str, state: str, text: str = "") -> 
 
 def artifact_update(task_id: str, context_id: str, text: str) -> dict:
     """v1.0 StreamResponse with an artifactUpdate member."""
-    artifact = {"artifactId": uuid.uuid4().hex, "parts": [text_part(text)]}
+    parts = [text_part(text)]
+    parsed = _extract_fenced_json(text)
+    if parsed is not None:
+        parts.append(data_part(parsed))
+    artifact = {"artifactId": uuid.uuid4().hex, "parts": parts}
     return {"artifactUpdate": {"taskId": task_id, "contextId": context_id, "artifact": artifact}}
+
 
 
 def sse_data(payload: dict, req_id: Any = None) -> str:
